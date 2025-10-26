@@ -10,11 +10,16 @@ class GestureUtils:
 
     @staticmethod
     def is_pinch(index, thumb, threshold=45):
+        """True when index and thumb are close enough (pixels)"""
         return GestureUtils.distance(index, thumb) < threshold
 
     @staticmethod
-    def is_fist(fingers_status, min_fingers_up=1):
-        # fist means few or zero fingers up; count up fingers
+    def is_fist(fingers_status, max_fingers_up=0):
+        """
+        fingers_status: [thumb, index, middle, ring, pinky] booleans
+        If number of fingers up <= max_fingers_up, consider it a fist.
+        """
         if fingers_status is None:
             return False
-        return sum(1 for f in fingers_status if f) <= min_fingers_up  # allow tiny tolerance
+        up_count = sum(1 for f in fingers_status if f)
+        return up_count <= max_fingers_up
