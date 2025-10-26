@@ -8,14 +8,21 @@ from gestures.gesture_utils import GestureUtils
 from core.draw_engine import DrawEngine
 from core.controller import GestureController
 
+# Initialize
 cap = cv2.VideoCapture(0)
 tracker = HandTracker(maxHands=1, detectionConfidence=0.6, trackConfidence=0.6, smooth_factor=5)
 utils = GestureUtils()
 drawer = DrawEngine(stroke_thickness=5)
 controller = GestureController()
 
-last_mode = None
-cooldown_until = 0.0
+# Debounce & cooldown timers
+fist_hold_start = None
+fist_required_hold = 0.4  # seconds required to confirm a fist -> UNDO
+erase_cooldown = 0.8
+next_allowed_erase_time = 0.0
+
+pinch_hold_start = None
+pinch_required_hold = 0.05  # small hold to stabilize pinch detection
 
 def draw_ui(frame, mode):
     # Mode label
@@ -23,8 +30,8 @@ def draw_ui(frame, mode):
     # Tips
     tips = [
         "Draw: Pinch index + thumb",
-        "Undo (Erase last): Make a fist",
-        "Stop: Open hand",
+        "Undo (Erase last): Make a tight fist and hold 0.4s",
+        "Stop: Open hand (3+ fingers up)",
         "Clear: Press 'c'"
     ]
     y = 80
@@ -44,37 +51,57 @@ while True:
     index_pos = pts.get('index') if pts else None
     thumb_pos = pts.get('thumb') if pts else None
 
-    # detect draw pinch (index+thumb)
-    draw_gesture = utils.is_pinch(index_pos, thumb_pos, threshold=45) if index_pos and thumb_pos else False
-
-    # detect fist (few fingers up) -> erase/undo
-    erase_gesture = utils.is_fist(fingers, min_fingers_up=0) if fingers is not None else False
-
-    # basic cooldown to avoid repeated accidental triggers for erase
     now = time.time()
-    if erase_gesture and now < cooldown_until:
-        # ignore erase during cooldown
-        erase_gesture = False
 
-    mode = controller.update_mode(draw_gesture, erase_gesture)
-
-    # whenever a new erase action occurs, set small cooldown and do update
-    if mode == "ERASE" and (last_mode != "ERASE"):
-        drawer.update(None, "ERASE")
-        cooldown_until = time.time() + 0.8  # 0.8s cooldown
-    elif mode == "DRAW":
-        drawer.update(index_pos, "DRAW")
+    # Pinch (draw) detection (requires small stable hold)
+    is_pinch = False
+    if index_pos and thumb_pos:
+        if utils.is_pinch(index_pos, thumb_pos, threshold=45):
+            if pinch_hold_start is None:
+                pinch_hold_start = now
+            elif (now - pinch_hold_start) >= pinch_required_hold:
+                is_pinch = True
+        else:
+            pinch_hold_start = None
     else:
-        drawer.update(None, "STOP")
+        pinch_hold_start = None
 
-    last_mode = mode
+    # Fist detection requires holding (to avoid accidental triggers)
+    is_fist = False
+    if fingers is not None:
+        if utils.is_fist(fingers, max_fingers_up=0):
+            if fist_hold_start is None:
+                fist_hold_start = now
+            elif (now - fist_hold_start) >= fist_required_hold and now >= next_allowed_erase_time:
+                is_fist = True
+                next_allowed_erase_time = now + erase_cooldown
+                fist_hold_start = None  # reset
+        else:
+            fist_hold_start = None
+
+    # Map gestures (priority in controller)
+    mode = controller.update_mode(is_pinch, is_fist, fingers)
+
+
+    # Update drawing engine
+    if mode == "ERASE" and mode != controller.mode:
+        # handled by controller priority already; actual erase action is performed by update call
+        pass
+
+    if mode == "DRAW":
+        drawer.update(index_pos, "DRAW")
+    elif mode == "STOP":
+        drawer.update(None, "STOP")
+    elif mode == "ERASE":
+        drawer.update(None, "ERASE")
+
     frame = drawer.draw(frame)
     draw_ui(frame, mode)
 
-    cv2.imshow("Gesture Painter - Day3 Stable", frame)
+    cv2.imshow("Gesture Painter - Stable (Day3)", frame)
 
     key = cv2.waitKey(1) & 0xFF
-    if key == 27:
+    if key == 27:  # Esc
         break
     elif key == ord('c'):
         drawer.clear()
