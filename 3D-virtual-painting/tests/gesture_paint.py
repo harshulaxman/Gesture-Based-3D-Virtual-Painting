@@ -37,7 +37,7 @@ except Exception as e:
 CAM_INDEX = 0
 WIN_W, WIN_H = 1280, 720
 BAR_H = 90
-HOVER_DELAY = 0.5
+HOVER_DELAY = 0.3
 FIST_HOLD = 0.4
 ERASE_COOLDOWN = 0.8
 PINCH_HOLD = 0.05
@@ -251,32 +251,83 @@ while True:
                 pointer_pos = None
 
         # pinch detection
+        # pinch detection (continuous + tolerant)
+        PINCH_ON_DIST = 60     # distance to start drawing (pixels)
+        PINCH_OFF_DIST = 85    # distance to stop drawing (pixels)
+        PINCH_MEMORY_TIME = 0.25  # seconds of tolerance
+
         is_pinch = False
         if points and index_raw and thumb_raw:
-            if utils.is_pinch(index_raw, thumb_raw, threshold=45):
-                if pinch_start is None:
-                    pinch_start = time.time()
-                elif time.time() - pinch_start >= PINCH_HOLD:
+            dist = utils.distance(index_raw, thumb_raw)
+
+            # use hysteresis: if pinch was active, allow more lenient release
+            if "pinching" in globals() and globals()["pinching"]:
+                if dist < PINCH_OFF_DIST:
                     is_pinch = True
+                else:
+                    globals()["pinching"] = False
             else:
-                pinch_start = None
+                if dist < PINCH_ON_DIST:
+                    is_pinch = True
+                    globals()["pinching"] = True
         else:
-            pinch_start = None
+            globals()["pinching"] = False
+
+        # maintain short pinch memory
+        if not is_pinch:
+            if "last_pinch_time" in globals() and time.time() - globals()["last_pinch_time"] < PINCH_MEMORY_TIME:
+                is_pinch = True
+        else:
+            globals()["last_pinch_time"] = time.time()
+
+
 
         # fist detection (undo)
         is_fist = False
-        now_t = time.time()
-        if fingers is not None:
-            if utils.is_fist(fingers, max_fingers_up=0):
-                if fist_start is None:
-                    fist_start = now_t
-                elif now_t - fist_start >= FIST_HOLD and now_t >= last_erase_time + ERASE_COOLDOWN:
-                    drawer.update(None, "ERASE")
-                    last_erase_time = now_t
+        fingers_up_count = 5  # default value to avoid NameError
+        avg_dist = 999        # default large value
+
+        if points and fingers is not None:
+                fingers_up_count = sum(fingers)
+        # get wrist and fingertip distances
+                wrist = points.get("wrist")
+                tips = [points.get(name) for name in ["index", "middle", "ring", "pinky"] if points.get(name)]
+                if wrist and len(tips) >= 2:
+                    avg_dist = sum(math.hypot(t[0]-wrist[0], t[1]-wrist[1]) for t in tips) / len(tips)
+
+    # thresholds
+                FIST_FINGER_THRESHOLD = 2   # fingers up allowed
+                FIST_DIST_THRESHOLD = 80    # average distance to wrist (px)
+
+                if fingers_up_count <= FIST_FINGER_THRESHOLD and avg_dist < FIST_DIST_THRESHOLD:
+                    if fist_start is None:
+                        fist_start = now_t
+                    elif now_t - fist_start >= FIST_HOLD and now_t >= last_erase_time + ERASE_COOLDOWN:
+                        drawer.update(None, "ERASE")
+                        last_erase_time = now_t
+                        fist_start = None
+                        is_fist = True
+                else:
                     fist_start = None
-                    is_fist = True
-            else:
+        else:
+            fist_start = None
+
+
+        # thresholds
+        FIST_FINGER_THRESHOLD = 2   # fingers up
+        FIST_DIST_THRESHOLD = 80    # pixels; tune if needed
+
+        if fingers_up_count <= FIST_FINGER_THRESHOLD and avg_dist < FIST_DIST_THRESHOLD:
+            if fist_start is None:
+                fist_start = now_t
+            elif now_t - fist_start >= FIST_HOLD and now_t >= last_erase_time + ERASE_COOLDOWN:
+                drawer.update(None, "ERASE")
+                last_erase_time = now_t
                 fist_start = None
+                is_fist = True
+        else:
+            fist_start = None
+
 
         # palm detection for erase mode
         is_palm_open = False
@@ -291,7 +342,7 @@ while True:
         if gesture_on and points and points.get("index") and fingers is not None:
             hx, hy = points["index"]
             # update hover timers only when palm open to avoid accidental selection
-            if sum(1 for f in fingers if f) >= 4:
+            if sum(fingers) >= 3:  # allow 3+ fingers to count as palm
                 for i, rect in enumerate(rects):
                     (x1,y1),(x2,y2) = rect
                     if x1 <= hx <= x2 and y1 <= hy <= y2:
@@ -356,16 +407,10 @@ while True:
                         new_stroke = [pt for pt in stroke if math.hypot(pt[0]-px, pt[1]-py) > erase_radius]
                         if new_stroke: new_strokes.append(new_stroke)
                     drawer.strokes = new_strokes if new_strokes else [[]]
-        elif active_tool == "ERASER":
-            if pointer_pos:
-                px,py = pointer_pos
-                cv2.circle(frame,(px,py),18,(20,20,20),-1)
-                new_strokes=[]
-                erase_radius=25
-                for stroke in drawer.strokes:
-                    new_stroke = [pt for pt in stroke if math.hypot(pt[0]-px,pt[1]-py) > erase_radius]
-                    if new_stroke: new_strokes.append(new_stroke)
-                drawer.strokes = new_strokes if new_strokes else [[]]
+        elif active_tool == "ERASER" and pointer_pos:
+            # precise eraser using raster layer
+            drawer.erase_at(pointer_pos, radius=20)
+
 
         # render strokes
         frame_for_save = frame.copy()
@@ -390,19 +435,23 @@ while True:
         draw_debug_overlay(rendered, bool(points), is_pinch, is_palm_open, is_fist, mode, gesture_on, hover_highlight)
 
         # show
+        # show
         cv2.imshow(WINDOW_NAME, rendered)
+        if hover_highlight is not None:
+            (x1, y1), (x2, y2) = rects[hover_highlight]
+            cv2.rectangle(rendered, (x1-6, y1-6), (x2+6, y2+6), (0,255,255), 2)
 
-        # detect window close properly
-        if cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
-            print("[INFO] Window closed by user. Exiting...")
+        # ---- reliable exit detection ----
+        key = cv2.waitKey(1)
+        if key == 27 or key == ord("q"):
+            print("[INFO] ESC/Q pressed → closing.")
             break
 
-        # small wait
-        if cv2.waitKey(1) & 0xFF == 27:
-            # still allow ESC to close for debugging, user previously didn't want keyboard exit but
-            # keeping this here as an emergency; you can ignore pressing ESC in demo.
-            print("[INFO] ESC pressed. Exiting.")
+        # sometimes getWindowProperty returns 0 only once; check <=0 to be sure
+        if cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_AUTOSIZE) <= 0:
+            print("[INFO] Window closed by user → exiting.")
             break
+
 
     except KeyboardInterrupt:
         break
