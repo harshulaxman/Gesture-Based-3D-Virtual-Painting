@@ -1,89 +1,93 @@
+# src/gestures/gesture_tracker.py
 import cv2
 import mediapipe as mp
+from collections import deque
 
 class HandTracker:
-    """
-    Tracks a single hand and provides finger landmark positions
-    for gesture-based controls (draw, erase, undo, hover, etc.)
-    """
-
-    def __init__(self, maxHands=1, detectionConfidence=0.7, trackConfidence=0.6, smooth_factor=5):
-        self.maxHands = maxHands
-        self.detectionConfidence = detectionConfidence
-        self.trackConfidence = trackConfidence
+    def __init__(self, maxHands=1, detectionConfidence=0.6, trackConfidence=0.6, smooth_factor=5):
+        self.mp_hands = mp.solutions.hands
+        self.hands = self.mp_hands.Hands(
+            max_num_hands=maxHands,
+            min_detection_confidence=detectionConfidence,
+            min_tracking_confidence=trackConfidence)
+        self.mp_draw = mp.solutions.drawing_utils
         self.smooth_factor = smooth_factor
-
-        self.mpHands = mp.solutions.hands
-        self.hands = self.mpHands.Hands(
-            max_num_hands=self.maxHands,
-            min_detection_confidence=self.detectionConfidence,
-            min_tracking_confidence=self.trackConfidence
-        )
-        self.mpDraw = mp.solutions.drawing_utils
+        self.prev_points = deque(maxlen=smooth_factor)
         self.results = None
-        self.hand_label = None
+        self.hand_label = None  # 'Left' or 'Right'
 
     def findHands(self, frame, draw=True):
-        """
-        Processes the frame and returns it with optional landmarks drawn.
-        """
-        imgRGB = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        self.results = self.hands.process(imgRGB)
-
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        self.results = self.hands.process(rgb)
+        self.hand_label = None
         if self.results.multi_hand_landmarks:
+            if self.results.multi_handedness:
+                # Use first hand's handedness label
+                try:
+                    self.hand_label = self.results.multi_handedness[0].classification[0].label
+                except Exception:
+                    self.hand_label = None
             for handLms in self.results.multi_hand_landmarks:
                 if draw:
-                    self.mpDraw.draw_landmarks(frame, handLms, self.mpHands.HAND_CONNECTIONS)
-            # Use first hand only
-            handedness = self.results.multi_handedness[0].classification[0].label
-            self.hand_label = handedness  # "Left" or "Right"
-        else:
-            self.hand_label = None
-
+                    self.mp_draw.draw_landmarks(frame, handLms, self.mp_hands.HAND_CONNECTIONS)
         return frame
+
+    def _smooth_point(self, x, y):
+        self.prev_points.append((x, y))
+        sx = int(sum(p[0] for p in self.prev_points) / len(self.prev_points))
+        sy = int(sum(p[1] for p in self.prev_points) / len(self.prev_points))
+        return sx, sy
+
+    def _landmark_to_point(self, lm, w, h):
+        return int(lm.x * w), int(lm.y * h)
 
     def get_finger_positions(self, frame):
         """
-        Returns a dictionary of key finger landmark coordinates.
-        Keys: thumb, index, middle, ring, pinky, wrist
+        Returns dict: {'thumb':(x,y), 'index':(x,y), 'middle':..., 'ring':..., 'pinky':...}
+        or None if no hand detected.
+        Note: index gets smoothing applied, others are raw.
         """
-        lm_positions = {}
         if not self.results or not self.results.multi_hand_landmarks:
-            return lm_positions
+            return None
 
         h, w, _ = frame.shape
-        handLms = self.results.multi_hand_landmarks[0]
-        for id, lm in enumerate(handLms.landmark):
-            cx, cy = int(lm.x * w), int(lm.y * h)
-            if id == 4: lm_positions["thumb"] = (cx, cy)
-            elif id == 8: lm_positions["index"] = (cx, cy)
-            elif id == 12: lm_positions["middle"] = (cx, cy)
-            elif id == 16: lm_positions["ring"] = (cx, cy)
-            elif id == 20: lm_positions["pinky"] = (cx, cy)
-            elif id == 0: lm_positions["wrist"] = (cx, cy)
-        return lm_positions
+        hand = self.results.multi_hand_landmarks[0]
+        tips_idx = {'thumb':4, 'index':8, 'middle':12, 'ring':16, 'pinky':20}
+        points = {}
+        for name, idx in tips_idx.items():
+            lm = hand.landmark[idx]
+            x, y = self._landmark_to_point(lm, w, h)
+            if name == 'index':
+                points[name] = self._smooth_point(x, y)
+            else:
+                points[name] = (x, y)
+        return points
 
     def fingers_up(self, frame):
         """
-        Detects which fingers are raised.
-        Returns a list of 5 values [thumb, index, middle, ring, pinky]
-        where 1 = finger up, 0 = down.
+        Returns list [thumb_up, index_up, middle_up, ring_up, pinky_up] or None
+        Using tip vs pip positions (index->pinky). Thumb uses x relative to ip depending on handedness.
         """
         if not self.results or not self.results.multi_hand_landmarks:
-            return [0, 0, 0, 0, 0]
+            return None
 
-        handLms = self.results.multi_hand_landmarks[0]
+        hand = self.results.multi_hand_landmarks[0]
+        # tip and pip indices
         tips = [4, 8, 12, 16, 20]
-        fingers = []
-
-        # Thumb (depends on hand orientation)
-        if self.hand_label == "Right":
-            fingers.append(1 if handLms.landmark[tips[0]].x < handLms.landmark[tips[0]-1].x else 0)
-        else:
-            fingers.append(1 if handLms.landmark[tips[0]].x > handLms.landmark[tips[0]-1].x else 0)
-
-        # Other four fingers
-        for tipId in tips[1:]:
-            fingers.append(1 if handLms.landmark[tipId].y < handLms.landmark[tipId-2].y else 0)
-
-        return fingers
+        pips = [3, 6, 10, 14, 18]
+        status = []
+        for t, p in zip(tips, pips):
+            tip = hand.landmark[t]
+            pip = hand.landmark[p]
+            if t != 4:
+                status.append(tip.y < pip.y)  # True if tip is above pip (finger up)
+            else:
+                # thumb: for right hand, tip.x < ip.x when thumb is open to left side of image
+                if self.hand_label == 'Right':
+                    status.append(tip.x < pip.x)
+                elif self.hand_label == 'Left':
+                    status.append(tip.x > pip.x)
+                else:
+                    # unknown handedness -> fallback to comparing x with ip
+                    status.append(tip.x < pip.x)
+        return status

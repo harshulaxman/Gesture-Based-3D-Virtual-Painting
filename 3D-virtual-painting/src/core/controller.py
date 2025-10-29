@@ -1,29 +1,28 @@
+# src/core/controller.py
 class GestureController:
-    """
-    Handles gesture-to-mode mapping for virtual painting.
-    Maps:
-      - Pinch → DRAW mode
-      - Palm → ERASE mode
-      - No gesture → STOP mode
-    """
-
     def __init__(self):
         self.mode = "STOP"
 
-    def update_mode(self, is_pinch: bool, is_palm: bool, fingers=None) -> str:
+    def update_mode(self, draw_gesture, erase_gesture, fingers):
         """
-        Updates current gesture mode based on detected hand state.
-        Args:
-            is_pinch (bool): True if pinch gesture detected.
-            is_palm (bool): True if palm open.
-            fingers (list): Optional list of finger states (for future logic).
-        Returns:
-            str: "DRAW", "ERASE", or "STOP"
+        Priority order:
+        1. ERASE only when fist (0 fingers up)
+        2. DRAW only when pinch and other fingers NOT closed like fist
+        3. Otherwise STOP
         """
-        if is_pinch:
-            self.mode = "DRAW"
-        elif is_palm:
+        # Count how many fingers are up
+        fingers_up_count = sum(fingers) if fingers else 0
+
+        # ✅ Highest priority – ERASE with real fist
+        if erase_gesture and fingers_up_count == 0:
             self.mode = "ERASE"
+
+        # ✅ DRAW only if pinch detected and not fist-like
+        elif draw_gesture and fingers_up_count >= 1:
+            self.mode = "DRAW"
+
+        # ✅ Default
         else:
             self.mode = "STOP"
+
         return self.mode
