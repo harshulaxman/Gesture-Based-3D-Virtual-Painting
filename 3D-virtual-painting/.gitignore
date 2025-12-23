@@ -1,2 +1,8 @@
 __pycache__/
 *.pyc
+# Unity generated folders
+unity/Library/
+unity/Temp/
+unity/Logs/
+unity/Build/
+unity/obj/

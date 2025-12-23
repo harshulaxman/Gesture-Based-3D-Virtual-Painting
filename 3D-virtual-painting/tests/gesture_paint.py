@@ -1,11 +1,39 @@
 """
 Gesture Painter — Smooth, Continuous Brush
-Pinch = Draw | Spread Fingers = Erase | Fist = Undo | Hover color/tool to select
+Pinch = Draw | Spread Fingers = Erase | Fist = Stop| Hover color/tool to select
 """
 
 import os, sys, time, math, cv2, numpy as np
 from collections import deque
+import asyncio
+import websockets
+import json
+import threading
+import sys, os
+from python_sender import broadcast
 
+
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+TESTS_DIR = os.path.abspath(os.path.dirname(__file__))
+
+sys.path.insert(0, PROJECT_ROOT)
+sys.path.insert(0, TESTS_DIR)
+
+print("[DEBUG] PYTHONPATH:")
+for p in sys.path[:3]:
+	print(" ", p)
+
+# Get absolute path to project root
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+
+# Append the src folder to Python's module search path
+SRC_PATH = os.path.join(PROJECT_ROOT, "src")
+sys.path.insert(0, SRC_PATH)
+
+print("[DEBUG] Added to PYTHONPATH:", SRC_PATH)
+
+from networking.unity_bridge import UnityBridge
+unity = UnityBridge()
 # ---------- PATH FIX ----------
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'src')))
 
@@ -27,6 +55,7 @@ UNDO_COOLDOWN = 1.2
 EMA_ALPHA = 0.6
 INTERP_STEP = 4
 PINCH_MEMORY = 0.25
+last_send_time = 0
 
 # 🎨 Extended Paint Palette (includes Orange + Dark Green)
 PALETTE = [
@@ -124,7 +153,7 @@ def draw_header(frame):
 
     # Title text
     title = "GesturePaint"
-    subtitle = "Pinch = Draw   |   Spread Fingers = Erase   |   Fist = Undo"
+    subtitle = "Pinch = Draw   |   Spread Fingers = Erase  | Fist = Stop"
     font = cv2.FONT_HERSHEY_DUPLEX
     cv2.putText(frame, title, (40, 35), font, 1.1, (255, 255, 255), 2)
     cv2.putText(frame, subtitle, (350, 33), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (220, 220, 220), 1)
@@ -154,6 +183,8 @@ tracker = HandTracker(maxHands=1)
 utils = GestureUtils()
 drawer = DrawEngine(stroke_thickness=6)
 controller = GestureController()
+unity = UnityBridge("ws://localhost:8080/ws")
+
 
 rects = toolbar_rects()
 active_tool = "BRUSH"
@@ -170,8 +201,54 @@ pinch_last_time = 0.0
 prev_draw_pos = None
 show_help_until = time.time() + HELP_DURATION
 
-WINDOW_NAME = "Gesture Painter (AR)"
+WINDOW_NAME = "GestPainter 3D"
 print("[INFO] Running... (Pinch=Draw, Spread=Erase, Fist=Undo, Hover color/tool to select)")
+def clear_canvas(drawer):
+    # Safely reset all known drawing buffers
+    if hasattr(drawer, "strokes"):
+        drawer.strokes = []
+
+    if hasattr(drawer, "current_stroke"):
+        drawer.current_stroke = []
+
+    if hasattr(drawer, "temp_points"):
+        drawer.temp_points = []
+
+    if hasattr(drawer, "canvas"):
+        drawer.canvas = None
+
+    if hasattr(drawer, "layer"):
+        h, w = WIN_H, WIN_W
+        drawer.layer = np.zeros((h, w, 3), dtype=np.uint8)
+
+    print("[CLEAR] Canvas fully cleared!")
+
+unity_ws = None   # global socket
+
+async def unity_sender():
+    global unity_ws
+    uri = "ws://localhost:8080"
+
+    while True:
+        try:
+            print("[UNITY] Connecting to WebSocket...")
+            unity_ws = await websockets.connect(uri)
+            print("[UNITY] Connected.")
+            break
+        except:
+            print("[UNITY] Retry connection...")
+            await asyncio.sleep(1)
+
+    # Keep the connection alive
+    while True:
+        await asyncio.sleep(0.01)
+def start_ws_thread():
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(unity_sender())
+
+ws_thread = threading.Thread(target=start_ws_thread, daemon=True)
+ws_thread.start()
 
 # ---------- MAIN LOOP ----------
 while True:
@@ -209,25 +286,79 @@ while True:
     elif now_t - pinch_last_time < PINCH_MEMORY:
         mode = "DRAW"
 
-    # --- FIST for Undo ---
+    # ---------- GESTURE DETECTION ----------
+
+    # Default
+    mode = "STOP"
+    is_fist = False
+
+    # Detect hand landmarks
     fingers_up_count = sum(fingers) if fingers else 5
     avg_dist = 999
     if points and fingers:
         wrist = points.get("wrist")
-        tips = [points.get(n) for n in ["index","middle","ring","pinky"] if points.get(n)]
+        tips = [points.get(n) for n in ["index", "middle", "ring", "pinky"] if points.get(n)]
         if wrist and tips:
-            avg_dist = sum(math.hypot(t[0]-wrist[0], t[1]-wrist[1]) for t in tips) / len(tips)
+            avg_dist = sum(math.hypot(t[0] - wrist[0], t[1] - wrist[1]) for t in tips) / len(tips)
+    if smoothed_pos and now_t - last_send_time > 0.03:  # ~30 FPS
+        unity.send({
+            "x": float(smoothed_pos[0]),
+            "y": float(smoothed_pos[1]),
+            "z": 0.0,
+            "draw": (mode == "DRAW"),
+            "erase": (mode == "ERASE"),
+            "fist": is_fist
+        })
+        last_send_time = now_t
+
+
+    # --- Detect FIST (pause everything) ---
     if fingers_up_count <= 2 and avg_dist < 80:
-        if fist_start is None:
-            fist_start = now_t
-        elif (now_t - fist_start) > FIST_HOLD and (now_t - last_undo_time) > UNDO_COOLDOWN:
-            if hasattr(drawer, "strokes") and drawer.strokes:
-                drawer.strokes.pop()
-                print("[GESTURE] ✊ Fist → Undo")
-            last_undo_time = now_t
-            fist_start = None
+        is_fist = True
+        mode = "STOP"
+        prev_draw_pos = None
+        drawer.update(None, "STOP")   # force stop drawing
+        cv2.putText(frame, "✊ FIST DETECTED - DRAWING PAUSED", (40, 70),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
     else:
-        fist_start = None
+        # Only run pinch/erase logic if fist is NOT detected
+        if points and "index" in points and "thumb" in points:
+            ix, iy = points["index"]
+            tx, ty = points["thumb"]
+            dist = math.hypot(ix - tx, iy - ty)
+            if dist < 50:          # Pinch = Draw
+                mode = "DRAW"
+                pinch_last_time = now_t
+            elif dist > 100:       # Spread fingers = Erase
+                mode = "ERASE"
+            else:
+                mode = "STOP"
+        elif now_t - pinch_last_time < PINCH_MEMORY:
+            mode = "DRAW"
+        else:
+            mode = "STOP"
+
+    # ---------- APPLY MODE ----------
+    if not is_fist:
+        if mode == "DRAW" and smoothed_pos:
+            for p in interpolate_points(prev_draw_pos, smoothed_pos):
+                drawer.update(p, "DRAW")
+            prev_draw_pos = smoothed_pos
+            active_tool = "BRUSH"
+        elif mode == "ERASE" and smoothed_pos:
+            drawer.erase_at(smoothed_pos, radius=25)
+            active_tool = "ERASER"
+            prev_draw_pos = None
+            cv2.circle(frame, smoothed_pos, 25, (0, 0, 255), 2)
+            cv2.putText(frame, "ERASING...", (40, 70),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+        else:
+            drawer.update(None, "STOP")
+            prev_draw_pos = None
+    else:
+        # Fist overrides — no draw or erase
+        drawer.update(None, "STOP")
+        prev_draw_pos = None
 
     # --- Hover select color/tool ---
     hovered_index = None
@@ -263,22 +394,51 @@ while True:
             else:
                 hover_timers.pop(i, None)
 
-    # --- Apply Draw/Erase ---
-    if mode == "DRAW" and smoothed_pos:
+    # --- Apply Draw/Erase with strict Fist override ---
+    if is_fist:
+        # Immediately stop any drawing when fist detected
+        drawer.update(None, "STOP")
+        prev_draw_pos = None
+        cv2.putText(frame, "✊ DRAWING PAUSED", (40, 70),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+
+    elif mode == "DRAW" and smoothed_pos:
+        # Only draw when not in fist mode
         for p in interpolate_points(prev_draw_pos, smoothed_pos):
             drawer.update(p, "DRAW")
         prev_draw_pos = smoothed_pos
         active_tool = "BRUSH"
+
     elif mode == "ERASE" and smoothed_pos:
         drawer.erase_at(smoothed_pos, radius=25)
         active_tool = "ERASER"
         prev_draw_pos = None
-        cv2.circle(frame, smoothed_pos, 25, (0,0,255), 2)
-        cv2.putText(frame, "ERASING...", (40,70),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255), 2)
+        cv2.circle(frame, smoothed_pos, 25, (0, 0, 255), 2)
+        cv2.putText(frame, "ERASING...", (40, 70),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+
     else:
         drawer.update(None, "STOP")
         prev_draw_pos = None
+
+    # --------- SEND POSITION + STATE TO UNITY ---------
+    if smoothed_pos and unity_ws:
+        try:
+            data = {
+                "x": float(smoothed_pos[0]),
+                "y": float(smoothed_pos[1]),
+                "z": 0.0,
+                "draw": (mode == "DRAW" and not is_fist),
+                "erase": (mode == "ERASE" and not is_fist),
+                "fist": is_fist
+            }
+            asyncio.run(unity_ws.send(json.dumps(data)))
+
+        except Exception as e:
+            print("[UNITY SEND ERROR]", e)
+            unity_ws = None
+
+
 
     rendered = drawer.draw(frame.copy())
 
@@ -294,6 +454,12 @@ while True:
 
     cv2.imshow(WINDOW_NAME, rendered)
     key = cv2.waitKey(1) & 0xFF
+
+    # --- CLEAR CANVAS (press 'C') ---
+    if key == ord('c'):
+        clear_canvas(drawer)
+        prev_draw_pos = None
+        print("[CLEAR] Canvas cleared.")
     if key == 27 or key == ord("q"):
         break
     if cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
