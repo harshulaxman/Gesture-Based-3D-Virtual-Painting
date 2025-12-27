@@ -2,7 +2,7 @@
 Gesture Painter — Smooth, Continuous Brush
 Pinch = Draw | Spread Fingers = Erase | Fist = Stop| Hover color/tool to select
 """
-
+import numpy as np
 import os, sys, time, math, cv2, numpy as np
 from collections import deque
 import asyncio
@@ -56,6 +56,22 @@ EMA_ALPHA = 0.6
 INTERP_STEP = 4
 PINCH_MEMORY = 0.25
 last_send_time = 0
+# ---------- 3D STROKE PARAMS ----------
+MIN_RADIUS = 0.01
+MAX_RADIUS = 0.06
+SPEED_SCALE = 0.09
+
+def compute_speed(curr, prev):
+    if curr is None or prev is None:
+        return 0.0
+    return math.hypot(curr[0] - prev[0], curr[1] - prev[1])
+
+def compute_radius(speed, depth=0.5, pressure=1.0):
+    r = SPEED_SCALE / (speed + 1e-3)
+    r *= (1.0 - depth)      # depth illusion
+    r *= pressure           # gesture pressure
+    return max(MIN_RADIUS, min(MAX_RADIUS, r))
+
 
 # 🎨 Extended Paint Palette (includes Orange + Dark Green)
 PALETTE = [
@@ -249,6 +265,8 @@ def start_ws_thread():
 
 ws_thread = threading.Thread(target=start_ws_thread, daemon=True)
 ws_thread.start()
+prev_time = time.time()
+prev_pos = None
 
 # ---------- MAIN LOOP ----------
 while True:
@@ -273,6 +291,23 @@ while True:
         smoothed_pos = ema(smoothed_pos, pointer_pos)
     else:
         smoothed_pos = ema(smoothed_pos, smoothed_pos) if smoothed_pos else None
+    # ---------- 3D STROKE CALC ----------
+    speed = compute_speed(smoothed_pos, prev_pos)
+
+    # pseudo-depth (MediaPipe z can be added later)
+    depth = 0.4
+
+    # Gesture-based pressure proxy
+    pressure = 1.0
+    if fingers:
+        if fingers == [0,1,1,0,0]:   # index + middle
+            pressure = 1.5
+        elif sum(fingers) <= 1:      # fist-ish
+            pressure = 2.0
+
+    radius = compute_radius(speed, depth, pressure)
+
+    prev_pos = smoothed_pos
 
     mode = "STOP"
     if points and "index" in points and "thumb" in points:
@@ -300,16 +335,19 @@ while True:
         tips = [points.get(n) for n in ["index", "middle", "ring", "pinky"] if points.get(n)]
         if wrist and tips:
             avg_dist = sum(math.hypot(t[0] - wrist[0], t[1] - wrist[1]) for t in tips) / len(tips)
-    if smoothed_pos and now_t - last_send_time > 0.03:  # ~30 FPS
+    if smoothed_pos and now_t - last_send_time > 0.03:
         unity.send({
             "x": float(smoothed_pos[0]),
             "y": float(smoothed_pos[1]),
             "z": 0.0,
-            "draw": (mode == "DRAW"),
-            "erase": (mode == "ERASE"),
+            "radius": radius,
+            "speed": speed,
+            "draw": (mode == "DRAW" and not is_fist),
+            "erase": (mode == "ERASE" and not is_fist),
             "fist": is_fist
         })
         last_send_time = now_t
+
 
 
     # --- Detect FIST (pause everything) ---
@@ -428,10 +466,13 @@ while True:
                 "x": float(smoothed_pos[0]),
                 "y": float(smoothed_pos[1]),
                 "z": 0.0,
+                "radius": radius,
+                "speed": speed,
                 "draw": (mode == "DRAW" and not is_fist),
                 "erase": (mode == "ERASE" and not is_fist),
                 "fist": is_fist
             }
+
             asyncio.run(unity_ws.send(json.dumps(data)))
 
         except Exception as e:
